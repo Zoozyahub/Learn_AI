@@ -127,7 +127,7 @@ with st.sidebar:
     
     # Информация о системе
     st.subheader("ℹ️ Информация")
-    st.info(f"**User ID:** {USER_ID}\n\n**Модель:** Qwen3:8b")
+    st.info(f"**User ID:** {USER_ID}\n\n**Модель:** Qwen3:4b")
 
 # Основная область - чат
 st.header("💬 Чат с агентом")

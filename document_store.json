@@ -1,0 +1,12 @@
+{
+  "default_user": [
+    {
+      "id": 1,
+      "name": "СГУ.pdf",
+      "file_path": "./uploads\\804b67ca-6e6b-46c0-a7f0-9e55a94d98b4.pdf",
+      "file_size": 135312,
+      "pinned": false,
+      "enabled": true
+    }
+  ]
+}

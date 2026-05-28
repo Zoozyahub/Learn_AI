@@ -155,8 +155,6 @@ threadpoolctl==3.6.0
 tiktoken==0.12.0
 tokenizers==0.22.2
 toml==0.10.2
-torch==2.9.1+cu128
-torchvision==0.24.1+cu128
 tornado==6.5.4
 tqdm==4.67.1
 transformers==4.57.3
