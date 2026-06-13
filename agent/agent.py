@@ -1,158 +1,173 @@
-from typing import TypedDict, List, Annotated
-from vector_database import search_documents_in_vector_database
+"""
+RAG-агент (stateless).
+
+Отличия от прежней версии:
+  • Никакого self.conversation_history — история передаётся снаружи
+    (грузится из таблицы messages перед каждым вызовом). Удалил сообщение
+    в БД → его не будет в истории.
+  • RAG только по активным документам (active_document_ids).
+  • Если активных документов нет — отвечаем на общих знаниях, добавив
+    в начало предупреждение (формирует роутер, не агент).
+  • Источники возвращаются отдельной структурой (а не внутри текста):
+    [{document_id, filename, page, score}], чтобы фронт отрисовал блок,
+    а роутер записал их в message_sources.
+  • Поддержка стриминга: stream_answer() — генератор токенов.
+
+Граф LangGraph оставлен для совместимости (search → respond), но для
+стриминга мы вызываем узлы напрямую, т.к. .stream() модели удобнее
+дёргать вне графа.
+"""
+
+from typing import TypedDict, Annotated, Iterator, Optional
 import operator
+
 from langgraph.graph import StateGraph
-from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage, AIMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import (
+    AnyMessage, HumanMessage, SystemMessage, AIMessage,
+)
 from langchain_openai import ChatOpenAI
 
+from agent.vector_database import search_with_scores
+from agent.deps import vector_user_id
 
-class AgentState(TypedDict):
-    """
-    Определяет состояние графа
-    
-    Атрибуты:
-        user_id: ID пользователя
-        retrieved_docs: Найденные документы из векторной БД
-        user_query: Вопрос пользователя
-        answer: Ответ LLM
-        messages: История сообщений для контекста
-    """
-    user_id: str
-    retrieved_docs: list[dict]
+
+SYSTEM_PROMPT_RAG = (
+    "Ты — помощник, который помогает пользователю на основе предоставленных "
+    "документов. Отвечай, опираясь на предоставленную информацию. "
+    "Если информации в документах недостаточно, честно сообщи об этом. "
+    "Указывать источники в тексте не нужно — они показываются отдельно."
+)
+
+SYSTEM_PROMPT_NO_DOCS = (
+    """Ты ассистент по обучению SunData и умеешь следующее:
+    - Ответить на все вопросы по загруженным документам
+    - Сгенерировать тест для проверки знаний
+    - Подготовить карточки для запоминания фактов из текста
+    Однако если ты видишь этот промпт значит пользователь задаёт вопрос без выбранных документов.
+    Если вопрос не касается функционала описанного выше, то дай обычной ответ основываясь на своих знаниях."""
+)
+
+
+class AgentState(TypedDict, total=False):
+    user_id: int
+    conversation_id: int
     user_query: str
+    active_document_ids: list[int]
+    retrieved: list[dict]            # [{content, filename, page, document_id, score}]
     answer: str
-    messages: Annotated[list[AnyMessage], operator.add]
+    history: list[AnyMessage]
 
 
 class Agent:
-    def __init__(self, model="default"):
-        if model == "default":
+    def __init__(self, model: Optional[object] = None, top_k: int = 5):
+        self.top_k = top_k
+        if model is None:
             self.model = ChatOpenAI(
                 base_url="http://localhost:11434/v1",
-                model="qwen3:8b",
-                api_key='1',
-                temperature=0.1
+                model="gemma4:31b-cloud",
+                api_key="1",
+                temperature=0.1,
             )
         else:
             self.model = model
-        
         self.graph = self._build_graph()
-        # Храним историю отдельно - только пары user/assistant
-        self.conversation_history: List[AnyMessage] = []
-    
+
     def _build_graph(self):
         graph = StateGraph(AgentState)
-        
-        graph.add_node("search_in_vector_db", self.search_in_vector_db)
-        graph.add_node("get_response", self.get_response)
-        
-        graph.set_entry_point("search_in_vector_db")
-        graph.add_edge("search_in_vector_db", "get_response")
-        
+        graph.add_node("search", self._search_node)
+        graph.add_node("respond", self._respond_node)
+        graph.set_entry_point("search")
+        graph.add_edge("search", "respond")
         return graph.compile()
-    
-    def search_in_vector_db(self, state: AgentState) -> dict:
-        user_query = state['user_query']
-        user_id = state['user_id']
-        
-        results = search_documents_in_vector_database(user_id, user_query, top_k=3)
-        
-        docs_list = []
-        for doc in results:
-            docs_list.append({
-                "Содержимое": doc.page_content,
-                "Имя файла": doc.metadata.get("filename"),
-                "Страница": str(int(doc.metadata.get("page")) + 1)
-            })
-        
-        return {"retrieved_docs": docs_list}
-    
-    def get_response(self, state: AgentState) -> dict:
-        # Формируем контекст из найденных документов
-        context_str = ""
-        for doc in state['retrieved_docs']:
-            context_str += f"Источник: {doc['Имя файла']}, Страница: {doc['Страница']}, Содержимое: {doc['Содержимое']}\n---\n"
-        
-        # Создаем список сообщений для промпта
-        messages_for_prompt = [
-            SystemMessage(content="""Ты - помощник, который помогает пользователю на основе предоставленных документов. Отвечай ТОЛЬКО на основе предоставленной информации.
-                          Обязательно указывай в ответе из какого файла и страницы взята информация. Если информации недостаточно, скажи пользователю, что не можешь ответить на вопрос.""")
-        ]
-        
-        # Добавляем историю диалога (только user/assistant сообщения)
-        messages_for_prompt.extend(self.conversation_history)
-        
-        
-        # Добавляем текущий вопрос с контекстом
-        current_query = f"Контекст из документов:\n{context_str}\n\nВопрос пользователя: {state['user_query']}"
-        messages_for_prompt.append(HumanMessage(content=current_query))
-        
-        # Получаем ответ от модели
-        print('\n=== PROMPT ===\n')
-        print(messages_for_prompt)
-        print('\n=== END OF PROMPT ===\n')
-        
-        response = self.model.invoke(messages_for_prompt)
-        
-        # Возвращаем ответ (НЕ добавляем в messages здесь)
-        return {"answer": response.content, "messages": [response]}
-    
-    def invoke(self, user_id: str, query: str) -> str:
-        """Основной метод для вызова агента"""
-        initial_state = AgentState(
-            user_id=user_id,
-            user_query=query,
-            retrieved_docs=[],
-            answer="",
-            messages=[]  # Пустой список для state
+
+    # ── Поиск (узел) ───────────────────────────────────────────
+    def _search_node(self, state: AgentState) -> dict:
+        retrieved = self.retrieve(
+            user_id=state["user_id"],
+            query=state["user_query"],
+            active_document_ids=state.get("active_document_ids"),
         )
-        
-        # Запускаем граф
-        result = self.graph.invoke(initial_state)
-        
-        # Сохраняем в историю ТОЛЬКО пару вопрос-ответ
-        self.conversation_history.append(HumanMessage(content=query))
-        self.conversation_history.append(AIMessage(content=result["answer"]))
-        
-        return result["answer"]
-    
-    def get_history(self) -> List[AnyMessage]:
-        """Возвращает чистую историю диалога"""
-        return self.conversation_history
-    
-    def print_history(self):
-        """Печатает историю в читаемом формате"""
-        print("\n=== ИСТОРИЯ ДИАЛОГА ===")
-        for msg in self.conversation_history:
-            role = "Пользователь" if isinstance(msg, HumanMessage) else "Ассистент"
-            print(f"\n{role}: {msg.content[:200]}{'...' if len(msg.content) > 200 else ''}")
-        print("\n" + "="*50 + "\n")
-    
-    def clear_history(self):
-        """Очищает историю диалога"""
-        self.conversation_history = []
+        return {"retrieved": retrieved}
 
+    def retrieve(
+        self,
+        user_id: int,
+        query: str,
+        active_document_ids: Optional[list[int]],
+    ) -> list[dict]:
+        """
+        Возвращает релевантные чанки. Если active_document_ids пуст/None —
+        возвращаем []. Решение «искать или нет» принимает роутер заранее
+        (передаёт None, если активных документов нет).
+        """
+        if not active_document_ids:
+            return []
+        pairs = search_with_scores(
+            user_id=vector_user_id(user_id),
+            query=query,
+            top_k=self.top_k,
+            active_document_ids=active_document_ids,
+        )
+        out: list[dict] = []
+        for doc, score in pairs:
+            page = doc.metadata.get("page", 0)
+            out.append({
+                "content": doc.page_content,
+                "filename": doc.metadata.get("filename", "unknown"),
+                "document_id": doc.metadata.get("document_id"),
+                "page": int(page) + 1 if isinstance(page, (int, float)) else 1,
+                "score": float(score),
+            })
+        return out
 
-if __name__ == "__main__":
-    # Пример использования
-    agent = Agent()
-    
-    while True:
-        user_id = "test_user"
-        query = input("\nВведите ваш вопрос (или 'exit' для выхода, 'history' для просмотра истории): ")
-        
-        if query.lower() == 'exit':
-            break
-        
-        if query.lower() == 'history':
-            agent.print_history()
-            continue
-        
-        if query.lower() == 'clear':
-            agent.clear_history()
-            print("История очищена!")
-            continue
-        
-        answer = agent.invoke(user_id, query)
-        print(f"\nОтвет агента: {answer}")
+    # ── Сборка промпта ─────────────────────────────────────────
+    def _build_messages(self, state: AgentState) -> list[AnyMessage]:
+        retrieved = state.get("retrieved", [])
+        has_docs = len(retrieved) > 0
+
+        system = SYSTEM_PROMPT_RAG if has_docs else SYSTEM_PROMPT_NO_DOCS
+        messages: list[AnyMessage] = [SystemMessage(content=system)]
+
+        # История диалога (user/assistant из БД)
+        messages.extend(state.get("history", []))
+
+        if has_docs:
+            context = "\n---\n".join(
+                f"Источник: {d['filename']}, страница: {d['page']}\n{d['content']}"
+                for d in retrieved
+            )
+            user_content = (
+                f"Контекст из документов:\n{context}\n\n"
+                f"Вопрос пользователя: {state['user_query']}"
+            )
+        else:
+            user_content = state["user_query"]
+
+        messages.append(HumanMessage(content=user_content))
+        return messages
+
+    # ── Ответ (узел, нестриминговый) ───────────────────────────
+    def _respond_node(self, state: AgentState) -> dict:
+        messages = self._build_messages(state)
+        response = self.model.invoke(messages)
+        return {"answer": response.content}
+
+    def invoke(self, state: AgentState) -> dict:
+        """Нестриминговый вызов: возвращает {answer, retrieved}."""
+        result = self.graph.invoke(state)
+        return {
+            "answer": result.get("answer", ""),
+            "retrieved": result.get("retrieved", []),
+        }
+
+    # ── Стриминг ───────────────────────────────────────────────
+    def stream_answer(self, state: AgentState) -> Iterator[str]:
+        """
+        Генератор токенов ответа. Поиск выполняется до стрима
+        (retrieved кладётся в state заранее роутером через retrieve()).
+        """
+        messages = self._build_messages(state)
+        for chunk in self.model.stream(messages):
+            token = getattr(chunk, "content", "") or ""
+            if token:
+                yield token

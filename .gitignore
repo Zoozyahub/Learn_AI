@@ -1,0 +1,6 @@
+storage
+uploads
+vector_database
+vector_db
+app_database.db
+__pycache__
